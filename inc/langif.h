@@ -73,7 +73,7 @@ typedef struct {/*unneeded*/} c4snet_data_t;
     svp_release(hnd, (fieldref_t)(void*)(ptr))
 
 static inline 
-c4snet_data_t* C4SNetAlloc(const struct io_cb* hnd, c4snet_type_t type, size_t size, void ∗∗data)
+c4snet_data_t* C4SNetAlloc(const struct io_cb* hnd, c4snet_type_t type, size_t size, void **data)
 {
     fieldref_t r = svp_new(hnd, size, type);
     svp_access(hnd, r, dataptr);
@@ -81,7 +81,7 @@ c4snet_data_t* C4SNetAlloc(const struct io_cb* hnd, c4snet_type_t type, size_t s
 }
 
 static inline
-size_t C4SNetSizeof(const struct io_cb* hnd, c4snet_data_t∗ ptr)
+size_t C4SNetSizeof(const struct io_cb* hnd, c4snet_data_t* ptr)
 {
     size_t v;
     svp_getmd(hnd, (fieldref_t)(void*)(ptr), &v, 0, 0);
@@ -89,7 +89,7 @@ size_t C4SNetSizeof(const struct io_cb* hnd, c4snet_data_t∗ ptr)
 }
 
 static inline
-void* C4SNetGetData(const struct io_cb* hnd, c4snet_data_t∗ ptr)
+void* C4SNetGetData(const struct io_cb* hnd, c4snet_data_t* ptr)
 {
     void *v;
     svp_access(hnd, (fieldref_t)(void*)(ptr), &v);

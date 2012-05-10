@@ -31,18 +31,20 @@ Also we want to support multiple box languages.
 In each language we want to support different allocation / destruction
 policies for different data types.
 
-Also we want to allow programs to use either "managed" allocation
-(outside of the box languages) and "unmanaged" allocation (using the
-box language allocator):
+Also we want to support both "internally managed" objects (by box language)
+and "externally managed" objects managed by the environment.
 
-- the managed allocation is "better" because it can allow nice tricks
-  like allocating storage physically closer to the eventual
-  destination of an object.
+- external allocation (by the environment) can be "better" because it
+  can allow nice tricks like allocating storage physically closer to
+  the eventual destination of an object.
 
-- however in some cases (eg SAC) the box language may not know
-  statically whether to use the managed allocator or its own (private)
-  allocator, so we want to be able to capture an object privately
-  allocated and put it in the database nonetheless.
+- however in some cases (eg SAC) the box language already supports its
+  own smart allocation and reference counting semantics and we want to
+  use just that.
+
+In both cases, fields have metadata and management structures, outside
+of the box languages, that need to be dynamically allocated and
+tracked as well.
 
 Also we want to stop once and for all the tooling headache about *link
 order*: If RTS A calls language B, and language B then calls API in
@@ -166,16 +168,113 @@ concrete data types.
 It can be *observed* from "outside" (eg for monitoring), and it can be
 *used* from "inside" (ie boxes).
 
+To the "inside" it provides two APIs: 
 
-To the "inside" it provides the following services:
+- one that delegates data management to the environment, called
+  "environment-managed API" (EMA)
 
-- organization of data in a common storage, with "smart references"
-- "sane" sharing semantics: an object is read-only if there are
-  multiple references to it, read-write if there is only one
-  reference.
-- allocation of new objects
-- capture of a non-managed data pointer
-- automatic deallocation
+- one that keeps control of data management to the box language,
+  called "language-managed API" (LMA).
+
+The contracts for object ownership differs between these two APIs as
+document below.
+
+Which API should be used depends on the concrete field type used. If the
+wrong API is used for a given concrete type (eg the EMA is used with
+the SAC array type, which should use LMA instead), an error would be reported.
+
+Language-managed API (LMA)
+---------------------------
+
+In this setting:
+
+- the box language's RTS must register some reference management
+  functions (make a new reference, drop a reference) upon system
+  initialization; and
+
+- in each box, direct pointers to the data allocated by the box
+  language are passed around:
+ 
+  - a box function receives directly a pointer to the data, not a
+    field reference;
+
+  - when a box function "sends" the data to ``out``, it must first
+    *wrap* the data pointer in a field container to obtain a field
+    reference.
+
+  - the pointer passed to the box function transfers ownership of that
+    reference. In particular, if the box consumes an input field 
+    and does not forward it via the ``out`` function, it must 
+    decrease its reference counter and check for deallocation.
+
+Usage in code
+`````````````
+
+For the LMA the ``io_cb`` API structure is extended as follows:
+
+.. code:: c
+
+   // fieldref_t is an opaque integer which names a field data item.
+   // The special value 0 means "null reference".
+   typedef ... fieldref_t;
+ 
+   // typeid_t is an opaque integer which names a concrete data type.
+   typedef ... typeid_t;
+ 
+   struct io_cb {
+      /* ... out, log already mentioned above .. */
+ 
+      // wrap: captures an opaque data pointer.
+      fieldref_t (*wrap)(struct io_cb*, typeid_t thetype, void* data);
+ 
+   };
+
+   /* to simplify calling */
+   #define svp_wrap(w, x, y)  x->api->wrap(w, x, y)
+ 
+The services have the following semantics:
+
+- ``wrap``: capture a data pointer.
+
+  Create an entry in the field database and associate it with
+  the provided pointer. ``wrap`` will increase the reference count
+  of the object, as per the language-specific reference management API.
+
+  Subsequently, whenever the environment needs to make a logical copy
+  of the object or release a copy, it will also call the language-provided 
+  reference management functions. 
+ 
+  See `Concrete type database`_ below.
+
+For example:
+
+.. code:: c
+ 
+   /* signature: {A}->{B},  mode LMA for A }
+   int box_func1(struct io_cb* cb,  void *arg)
+   {
+       /* this box simply forwards its input to its output. */
+       
+       svp_out(cb, svp_wrap(cb, MYTYPE, arg));
+   }
+
+
+   /* signature: {A}->{B},  mode LMA for A and B */
+   int box_func1(struct io_cb* cb,  void *arg)
+   {
+       /* this box consumes its input and produces an unrelated output */
+       
+       /* .. decrease reference on arg, check if it was last reference ... */
+ 
+       void *newdata = ...;
+       svp_out(cb, svp_wrap(cb, MYTYPE, newdata));
+   }
+
+
+
+Environment-managed API (EMA)
+-----------------------------
+
 
 For this purpose the ``io_cb`` API structure is extended as follows:
 
@@ -206,9 +305,6 @@ For this purpose the ``io_cb`` API structure is extended as follows:
       // clone: duplicate the object.
       fieldref_t (*clone)(const struct io_cb*, fieldref_t theref);
  
-      // wrap: captures an opaque data pointer.
-      fieldref_t (*wrap)(const struct io_cb*, typeid_t thetype, size_t size, void* data);
- 
       // resize: modify the logical size of the object.
       int (*resize)(const struct io_cb*, fieldref_t theref, size_t newsize);
  
@@ -219,7 +315,6 @@ For this purpose the ``io_cb`` API structure is extended as follows:
    #define svp_access(x, y, z)   x->api->access(x, y, z)
    #define svp_getmd(w, x, y, z) x->api->getmd(w, x, y, z)
    #define svp_clone(x, y)       x->api->clone(x, y)
-   #define svp_wrap(w, x, y, z)  x->api->wrap(w, x, y, z)
    #define svp_resize(x, y, z)   x->api->resize(x, y, z)
 
    
@@ -261,27 +356,19 @@ The services have the following semantics:
   ``getmd`` overwrites the variables provided by non-NULL address as
   argument by the corresponding fields metadata:
 
-  - ``*thesize``: requested/logical size (given to ``new``). Set to 0 if
-    the data was captured with ``wrap``.
+  - ``*thesize``: requested/logical size (given to ``new``). 
   
   - ``*thetype``: concrete type identifier.
 
   - ``*moresize``: *actual* allocated size. The difference with
     ``*thesize`` is made because ``new`` may have allocated more bytes
-    than requested. These bytes can be used. Set to 0 if the data
-    was captured with ``wrap``.
+    than requested. These bytes can be used. 
 
   Return value: as per ``access`` above.
 
 - ``clone``: duplicate the object, return a new reference to the fresh object.
 
   Return value: as per ``new`` above.
-
-- ``wrap``: capture a data pointer.
-
-  Create a managed entry in the field database and associate it with
-  the provided pointer and size. Subsequent calls to ``getmd`` will
-  return the provided size.
 
 - ``resize``: modify the logical size.
 
@@ -302,13 +389,8 @@ The services have the following semantics:
       size. In this case the program should make a new allocation and
       release the previous one.
   
-  If the data was captured with ``wrap``, resizing will simply modify
-  the "size" field. In particular ``resize`` will not call the
-  allocation/copy/deallocation functions associated with the concrete
-  type. 
-
 Example
--------
+```````
 
 We want to make a box "t2l" which takes one tag as input and converts
 it to a C "long long".
@@ -327,12 +409,10 @@ For this we can write the following code in ``boxes.c``:
        // allocation by the "environment"
        fieldref_t f = svp_new(cb, sizeof(long long), BYTES_SCALAR_ALIGNED);
  
-       // output the field reference; note
+       // output the field reference
        svp_out(cb, f);
- 
-       // that out does not "take away" ownership; instead it will
-       // add new references as needed. So we need to release here as well.
-       svp_release(cb, f);
+
+       return 0;
    }
 
 We can make a box which forwards its entire input string as a new
@@ -365,10 +445,10 @@ record except for the first character which is capitalized:
    }
 
 Discussion about box ownership
-------------------------------
+``````````````````````````````
 
 There was a discussion about who's responsible for releasing
-references manipulated by boxes.
+references manipulated by boxes, in case the EMA is used.
 
 There are two questions that need answering:
 
@@ -389,7 +469,7 @@ There are two questions that need answering:
    c. the environment, automatically after the box terminates.
 
 Analysis
-````````
+~~~~~~~~
 
 About 1a: yields memory leaks if the programmer forgets to do so.
 
@@ -459,7 +539,7 @@ a memory leak if the box is modified so that the loop never
 terminates.
 
 Solution
-````````
+~~~~~~~~
 
 We want to avoid a solution based on a "shallow copy" API, which would
 be highly confusing to box implementors. Instead we want to solve the
@@ -470,7 +550,7 @@ We do this as follows:
 - all the references that are given as input to a box function
   are placed on a "clean up" list attached to the box instance. 
 
-- each call to ``new``, ``wrap`` or ``clone`` by a box instance will
+- each call to ``new`` or ``clone`` by a box instance will
   cause the environment to store the reference to the newly allocated
   object in the "clean up" list.
 
@@ -482,7 +562,8 @@ We do this as follows:
   the clean up list.
 
   The reference is always removed from the clean up list, even if
-  there are multiple other references to the object.
+  there are multiple other references to the object and ``release`` simply 
+  decreases the reference count.
 
 With this modification to the semantics of ``release``, the box code
 can then *optionally* control deallocation. 
@@ -524,9 +605,10 @@ In contrast:
       return 0; 
    }
 
-The use of ``release`` forces early deallocation, and "remembers" that
-the deallocation has taken place by removing the reference from the
-clean up list.
+The use of ``release`` enables early deallocation, and "remembers"
+that the deallocation has taken place by removing the reference from
+the clean up list. This way there are no extraneous calls to
+``release`` after the box terminates.
 
 
 .. hint:: Implementation detail.
@@ -545,10 +627,10 @@ clean up list.
    following a filter which creates two conceptual copies of the same
    field as separate fields in its output record.
 
-   If the clean up list is a linked list on the objects themselves, a
-   naive implementation would have a problem: there would be only one
-   node on the list even if the object is listed as 2 separate
-   arguments of the box.
+   If the clean up list is a linked list using the objects themselves
+   as nodes, a naive implementation would have a problem: there would
+   be only one node on the list when the same object is listed as 2
+   separate arguments of the box.
 
    So instead each linked list node also stores the number of times
    the object is listed in the input argument list, which is also
@@ -569,15 +651,15 @@ The APIs proposed above are similar to C4SNet in the following fashion:
        svp_release(hnd, (fieldref_t)(void*)(ptr))
    
    static inline 
-   c4snet_data_t* C4SNetAlloc(const struct io_cb* hnd, c4snet_type_t type, size_t size, void ∗∗data)
+   c4snet_data_t* C4SNetAlloc(const struct io_cb* hnd, c4snet_type_t type, size_t size, void **data)
    {
        fieldref_t r = svp_new(hnd, size, type);
-       svp_access(hnd, r, dataptr);
+       svp_access(hnd, r, data);
        return (c4snet_data_t*)(void*)r;
    }
    
    static inline
-   size_t C4SNetSizeof(const struct io_cb* hnd, c4snet_data_t∗ ptr)
+   size_t C4SNetSizeof(const struct io_cb* hnd, c4snet_data_t* ptr)
    {
        size_t v;
        svp_getmd(hnd, (fieldref_t)(void*)(ptr), &v, 0, 0);
@@ -585,7 +667,7 @@ The APIs proposed above are similar to C4SNet in the following fashion:
    }
    
    static inline
-   void* C4SNetGetData(const struct io_cb* hnd, c4snet_data_t∗ ptr)
+   void* C4SNetGetData(const struct io_cb* hnd, c4snet_data_t* ptr)
    {
        void *v;
        svp_access(hnd, (fieldref_t)(void*)(ptr), &v);
@@ -593,9 +675,11 @@ The APIs proposed above are similar to C4SNet in the following fashion:
    }
 
 We list these "emulation" functions here for clarity and to illustrate
-how the new API differs from the old. The main change compared to the
-original C4SNet is that each API function learns "where" it was called
-from from its 1st argument.
+how the new API differs from the old, not to suggest that the old API should still
+be used.
+
+The main change compared to the original C4SNet is that each API
+function learns "where" it was called from from its 1st argument.
 
 Field management for the environment
 ====================================
@@ -620,24 +704,27 @@ So the ``io_cb`` that a control entity will use is extended as follows:
    #define svp_copyref(x, y)     x->api->copyref(x, y)
 
 After ``copyref`` is called, ``release`` must be called on both the
-original and the copy. 
+original and the copy.  
 
 ``copyref`` may return 0 to indicate an invalid reference was given as input.
+
+If the concrete type indicates the LMA is used, ``copyref`` will inform
+the language-specific reference management that a new reference was created.
 
 Each control entity will have its own "clean up" list. However,
 ``copyref`` does not touch the "clean up" list. In
 particular:
 
-- if the input reference ``r1`` is already on the "clean up" list, and
-  ``release`` is subsequently not used on ``r1``, then ``release``
-  will be automatically called on ``r1`` after the control entity ends.
+- if the input reference ``r`` is already on the "clean up" list, and
+  ``release`` is subsequently not used on ``r``, then ``release``
+  will be automatically called on ``r`` after the control entity ends.
  
 - however the result of ``copyref`` never goes on the "clean up" list 
   so it should be explicitly ``released`` somewhere:
  
   - either by the control entity itself, or
 
-  - it arrives as input at a box entity A, in which case it is placed on
+  - if it arrives as input at a box entity A, in which case it is placed on
     the clean up list of A before A is activated.
 
 Field database
@@ -671,6 +758,9 @@ delegate the actual management of data.
 So to give control of data to the field management database, each language
 must *register* its object management API to the environment.
 
+Common registration API
+-----------------------
+
 For this we provide the following API:
 
 .. code:: c
@@ -684,35 +774,138 @@ For this we provide the following API:
 
    struct reg_api {
       langid_t (*reg_lang)(const struct registrar* reg, struct lang_cb* langmgr, const char *humanname);
-      void     (*reg_type)(const struct registrar* reg, langid_t thelang, typeid_t thetype, const char *humanname);
    };
 
-   #define svp_reg_lang(x, y, z)    x->api->reg_lang(x, y)
-   #define svp_reg_type(w, x, y, z) x->api->reg_type(w, x, y, z)
+   #define svp_reg_lang(x, y, z)  x->api->reg_lang(x, y, z)
 
    struct lang_cb {
      int     (*init)(void** langctx);
      void    (*cleanup)    (void* langctx);
 
-     void*   (*allocate)   (void* langctx, typeid_t thetype, size_t thesize, size_t *realsize);
-     void    (*deallocate) (void* langctx, typeid_t thetype, size_t thesize, void* data);
-     void*   (*clone)      (void* langctx, typeid_t thetype, size_t thesize, void* data);
-
      size_t  (*getsersize) (void* langctx, typeid_t thetype, size_t objsize, const void *data);
      int     (*serialize)  (void* langctx, typeid_t thetype, size_t objsize, const void *data, char* dstbuf, size_t bufsize);
 
      size_t  (*getdesersize)(void* langctx, typeid_t thetype, const char* srcbuf, size_t bufsize);
-     int     (*deserialize)(void* langctx, typeid_t thetype, const char* srcbuf, size_t bufsize, void **data, size_t *objsize);
+     int     (*deserialize) (void* langctx, typeid_t thetype, const char* srcbuf, size_t bufsize, void **data, size_t *objsize);
    };
-      
+
 When a language run-time is started up, it can obtain a pointer to a
 ``struct registrar*``, which it can subsequently use to register
 itself and its type management.
 
-The function pointers ``init``, ``cleanup``, ``getdesersize`` are
-optional. All other function pointers are mandatory.
 
-For example:
+Intended semantics of the common management function
+````````````````````````````````````````````````````
+
+- ``getsersize``: get a conservative estimate of the buffer size
+  needed for serialization.
+
+- ``serialize``: serialize the data. The output buffer is
+  pre-allocated.
+
+- ``getdesersize``: get a conservative estimate of the object size
+  needed for deserialization.
+
+- ``deserialize``: deserialize the data. The output object is 
+  either pre-allocated (not-NULL) or not pre-allocated (NULL). The
+  ``deserialize`` function can also drop the pre-allocated object
+  and replace it with a new one.
+
+The environment guarantees it will call ``init`` after system
+initialization is complete but before the application starts up. After
+``init`` is called and if it returns 0, the environment will pass the
+value of ``langctx`` updated by ``init`` to all the other APIs, so
+that they can carry state around. If ``init`` returns non-zero, an error
+will be reported and the application will not be allowed to use that
+language interface.
+
+The other APIs (ser/deser) should assume they may be
+called concurrently and perform their own mutual exclusion if needed.
+
+The environment will also call ``cleanup`` after the application
+terminates but before the system shuts down.
+
+If ``getdesersize`` is not provided, the environment will provide a
+NULL ``data`` pointer to ``deserialize``, which should then thus
+allocate a fresh object.
+
+The reason why serialize/getsersize and deserialize/getdesersize are
+decoupled is that the environment may select different instances of the
+language-specific run-time system depending on where the data will be used.
+
+If the concrete type is language-managed (LMA), then the ``objsize``
+parameter to serialize/getsersize will be set to 0.
+
+Registration for LMA types
+--------------------------
+
+We extend ``reg_api`` as follows:
+
+.. code:: c
+
+   struct reg_api {
+      void     (*reg_lma_type)(const struct registrar* reg, langid_t thelang,
+                               typeid_t thetype, const char *humanname,
+                               struct lma_type_cb* tcb);
+   };
+
+   #define svp_reg_lma_type(w, x, y, z, t) w->api->reg_lma_type(w, x, y, z, t)
+
+   struct lma_type_cb {
+
+     // increment the reference counter.
+     void    (*incref)     (void* langctx, typeid_t thetype, void* data);
+
+     // decrement the reference counter, deallocate if reaches 0.
+     // return 1 if it was the last reference, ie effective deallocation took place.
+     int     (*decref)     (void* langctx, typeid_t thetype, void* data);
+
+     // report an estimate of the size in memory taken by the item of data.
+     // this is used for monitoring purposes.
+     size_t  (*getsize)    (void* langctx, typeid_t thetype, void* data);
+
+   };
+      
+Registration API for EMA types
+------------------------------
+
+We extend ``reg_api`` as follows:
+
+.. code:: c
+
+   struct reg_api {
+
+      void     (*reg_ema_type)(const struct registrar* reg, langid_t thelang,
+                               typeid_t thetype, const char *humanname,
+                               struct ema_type_cb* tcb);
+   };
+
+   #define svp_reg_ema_type(w, x, y, z, t) w->api->reg_lma_type(w, x, y, z, t)
+
+   struct ema_type_cb {
+     void*   (*allocate)   (void* langctx, typeid_t thetype, size_t thesize, size_t *realsize);
+     void    (*deallocate) (void* langctx, typeid_t thetype, size_t thesize, void* data);
+     void*   (*clone)      (void* langctx, typeid_t thetype, size_t thesize, void* data);
+   };
+
+Intended semantics of the EMA management functions
+```````````````````````````````````````````````````
+
+- ``allocate``: allocate a new object of the specified type and size
+  on the heap, return a pointer to it. Also update ``realsize`` with
+  the size actually usable by the program. For example a program may
+  require an allocation of 15 bytes and the minimum allocation size is
+  32 bytes. Then ``realsize`` should be updated to 32.
+
+- ``deallocate``: release a previously allocated object. The type and size
+  are both indicated for reference, in case the deallocator uses separate
+  heaps for different types/sizes.
+
+- ``clone``: duplicate an object.
+
+
+Example use
+```````````
 
 .. code:: c
 
@@ -720,19 +913,21 @@ For example:
    {
        struct lang_cb mycb = {
             NULL, NULL, /* no init() nor clean-up() for this language */
-            &mylang_alloc,
-            &mylang_dealloc,
-            &mylang_clone,
             &mylang_getsersize,
             &mylang_serialize,
             NULL, /* no getdesersize() for this language */
             &mylang_deserialize
             };
+       struct ema_type_cb mytcb = {
+            &mylang_alloc,
+            &mylang_dealloc,
+            &mylang_clone
+            };
 
        langid_t l = svp_reg_lang(reg, &mycb);        
-       svp_reg_type(reg, l, 0, "myconcretetypeA");
-       svp_reg_type(reg, l, 1, "myconcretetypeB");
-       svp_reg_type(reg, l, 2, "myconcretetypeC");
+       svp_reg_ema_type(reg, l, 0, "myconcretetypeA", &mytcb);
+       svp_reg_ema_type(reg, l, 1, "myconcretetypeB", &mytcb);
+       svp_reg_ema_type(reg, l, 2, "myconcretetypeC", &mytcb);
     }
 
 Predefined languages and types
@@ -742,7 +937,8 @@ The special ``langid_t`` with value 0 is the "common data language",
 which is the data language used by all entities which are not configured to
 use another data language.
 
-In the common data language the following types are predefined:
+In the common data language the following concrete type ids are
+predefined, to be used with the EMA:
 
 - ``BYTES_UNALIGNED``: size unit is bytes, no alignment expected.
 
@@ -757,59 +953,6 @@ In the common data language the following types are predefined:
   aligned.
 
 All these types serialize and deserialize to themselves.
-
-Intended semantics of the type management functions
----------------------------------------------------
-
-- ``allocate``: allocate a new object of the specified type and size
-  on the heap, return a pointer to it. Also update ``realsize`` with
-  the size actually usable by the program. For example a program may
-  require an allocation of 15 bytes and the minimum allocation size is
-  32 bytes. Then ``realsize`` should be updated to 32.
-
-- ``deallocate``: release a previously allocated object. The type and size
-  are both indicated for reference, in case the deallocator uses separate
-  heaps for different types/sizes.
-
-- ``clone``: duplicate an object.
-
-- ``getsersize``: get a conservative estimate of the buffer size
-  needed for serialization.
-
-- ``serialize``: serialize the data. The output buffer is
-  pre-allocated.
-
-- ``getdesersize``: get a conservative estimate of the object size
-  needed for deserialization.
-
-- ``deserialize``: deserialize the data. The ``deserialize`` function
-  should reuse the provided ``data`` pointer to regenerate the object
-  if it is not NULL and ``objsize`` is large enough; otherwise it
-  should deallocate the provided ``data`` pointer and substitute it
-  with a new allocation of the proper size. ``objsize`` should then be
-  updated accordingly.
-
-The environment guarantees it will call ``init`` after system
-initialization is complete but before the application starts up. After
-``init`` is called and if it returns 0, the environment will pass the
-value of ``langctx`` updated by ``init`` to all the other APIs, so
-that they can carry state around. If ``init`` returns non-zero, an error
-will be reported and the application will not be allowed to use that
-language interface.
-
-The other APIs (alloc/dealloc/clone/ser/deser) should assume they may be
-called concurrently and perform their own mutual exclusion if needed.
-
-The environment will also call ``cleanup`` after the application
-terminates but before the system shuts down.
-
-If ``getdesersize`` is not provided, the environment will provide a
-NULL ``data`` pointer to ``deserialize``, which should then thus
-allocate a fresh object.
-
-The reason why serialize/getsersize and deserialize/getdesersize are
-decoupled is that the environment may select different instances of the
-language-specific run-time system depending on where the data will be used.
 
 Wrapping up
 ===========

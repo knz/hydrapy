@@ -17,38 +17,42 @@
 import sys
 import os
 from colors import *
+from logging import *
+from fn import *
+
+# modes
+MODE_SEQ = 0
+MODE_MULT = 1
+MODE_SYNC = 2
+mode = MODE_SEQ
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print >>sys.stderr, "usage:", sys.argv[0], "<mode>"
+    if sys.argv[1] == "seq":
+        mode = MODE_SEQ
+    elif sys.argv[1] == "mult":
+        mode = MODE_MULT
+    elif sys.argv[1] == "sync":
+        mode = MODE_SYNC
 
 INFINITY = 10000
 
-# ------- some logging utilities
-debug = os.getenv('VERBOSE')
-ilevel = 0
-continued = False
-def log(msg):
-    global ilevel, continued
-    if debug is not None:
-        if continued is True:
-            continued = False
-            msg = '>' + msg
-        print >>sys.stderr, '--', ('|  ' * ilevel) + msg
+def minindex(a, b):
+    assert mode > MODE_SEQ
+    if mode <= MODE_SYNC:
+        # just compare numerically
+        return min(a,b)
+    else:
+        raise NotImplementedError
 
-def enter(msg):
-    global ilevel
-    log(msg + ':')
-    ilevel += 1
-
-def leave(obj = None):
-    global ilevel
-    log('<< %r' % obj)
-    ilevel -= 1
-    log('')
-    return obj
-
-def tailcall():
-    global ilevel, continued
-    log ('%s.. (tailcall)%s' % (cDARK, cNORMAL))
-    continued = True
-    ilevel -= 1
+def maxindex(a, b):
+    assert mode > MODE_SEQ
+    if mode <= MODE_SYNC:
+        # just compare numerically
+        return max(a, b)
+    else:
+        raise NotImplementedError
 
 # --------- basic objets/functions
 
@@ -56,61 +60,174 @@ def tailcall():
 #   keys = types
 #   values = values
 
-class Record(dict):
+class Rec(dict):
     def __repr__(self):
         return '%s%s%s' % (cGREEN, dict.__repr__(self), cNORMAL)
 
 class Container(object):
-    __slots__ = (  
-        'next',   # next in sub-stream sequence
-        'record', # record data 
-        'pos',    # position of the container in terms of the index of the last network element that it was output from
-        'pli',    # predecessor's lower index, ie the minimum pos value of all the container's predecessors
-        )
-
+    #fields:
+    #
+    #  next: next in sub-stream sequence
+    #  record: the record being referenced
+    #
+    # MODE_SEQ:
+    #  first: True if container is the first (ie not a successor)
+    #
+    # MODE_MULT:
+    #  pli, pos: network indices
+    #
 
     def __repr__(self):
         s = ''
         c = self
         while c is not None:
-            s += '[%r | pos %s%r%s pli %s%r%s]%s@%x%s ' % (c.record,
-                                                           cBLUE, c.pos, cNORMAL,
-                                                           cBLUE, c.pli, cNORMAL,
-                                                           cDARK, id(c), cNORMAL)
+
+            s += '[%r | ' % c.record
+
+            if mode <= MODE_MULT:
+                s += '%s' % ['succ', 'first'][int(c.first)]
+                if c.done:
+                    s += ' | %sDONE%s' % (cYELLOW, cNORMAL)
+            else: 
+                s += 'pos %s%r%s pli %s%r%s' % (cBLUE, c.pos, cNORMAL,
+                                                cBLUE, c.pli, cNORMAL,)
+                if c.pos == INFINITY:
+                    s += ' | %sDONE%s' % (cYELLOW, cNORMAL)                    
+
+            if c.deleted:
+                s += ' | %sdeleted%s' % (cRED, cNORMAL)
+
+            s += ']%s@%x%s ' % (cDARK, id(c), cNORMAL)
             c = c.next
         return s
 
-def createContainer():
-    c = Container()
-    c.next = None
-    c.record = None
-    c.pos = 0
-    c.pli = 0
+    @informobjp(updater = True)
+    def __init__(self):
+        # createContainer
+        self.next = None
+        self.record = None
 
-    log("createContainer -> %r" % c)
-    return c
+        if mode <= MODE_MULT:
+            self.first = False
+            self.done = False
+        else:
+            self.pos = 0
+            self.pli = 0
 
-def markAsFirst(c):
-    enter("markAsFirst(%r)" % c)
-    c.pli = INFINITY
-    log("c -> %r" % c)
-    leave()    
+        self.deleted = False
 
-def markNextPos(c):
-    enter("markNextPos(%r)" % c)
-    c.next.pli = min(c.pli, c.pos)
-    log("c -> %r" % c)
-    leave()
+    @informobjp(updater = True)
+    def setRec(self, r):
+        self.record = r
 
-def isFirst(c):
-    enter("isFirst(%r)" % c)
-    return leave(c.pli == INFINITY)
+    @informobj
+    def freeContainer(self):
+        # in python nothing to do, just drop ref
+        # however for checking we will mark it as deleted
+        self.deleted = True
 
+    # ---- accessors in use for the "seq" impl ----
+
+    @informobjp(updater = True)
+    def markAsFirst(self):
+        if mode <= MODE_MULT:
+            self.first = True
+        else:
+            self.pli = INFINITY
+
+    @informobj
+    def isFirst(self):
+        if mode <= MODE_MULT:
+            return self.first
+        else:
+            return self.pli == INFINITY
+
+    @informobjp(updater = True)
+    def propagateFirst(self):
+        thenext = self.next
+        while thenext.isDone():
+            thenext = thenext.next
+            thenext.freeContainer()
+
+        thenext.markAsFirst()
+
+    @informobjp(updater = True)
+    def markNextPos(self):
+
+        assert not self.next.isDone()
+
+        if mode <= MODE_MULT:
+            self.next.first = False
+        else:
+            self.next.pli = minindex(self.pli, self.pos)
+
+    # ---- accessors in use for the "mult" impl ----
+
+    @informobjp(updater = True)
+    def markAsDone(self):
+        assert mode > MODE_SEQ
+
+        assert not self.isDone()
+
+        if mode <= MODE_MULT:
+            self.done = True
+        else:
+            self.pos = INFINITY
+
+            # " After the container at the head of the cons-list reaches its end, markAsDone propa- gates its pli-value to its successor. " (7.4.1)
+            self.next.pli = self.pli
+        
+    # ---- accessors in use for the "sync" impl ----
+
+    @informobjp(updater = True)
+    def posInc(self):
+        assert mode > MODE_SEQ
+        if mode <= MODE_SYNC:
+            self.pos = self.pos + 1
+        else:
+            raise NotImplementedError
+
+    @informobjp(updater = True)
+    def propagatePli(self):
+        assert mode > MODE_MULT
+
+        thenext = self.next
+        while thenext.done:
+            thenext = thenext.next
+            thenext.freeContainer()
+
+        thenext.pli = self.pos
+
+    @informobj
+    def isDone(self):
+        if mode <= MODE_MULT:
+            return self.done
+        else:
+            return self.pos == INFINITY
+
+@inform
+def insertContainer(cont, c, r):
+    cp = Container()
+
+    cp.next = c.next
+    c.next = cp
+
+    c.markNextPos()
+
+    c.setRec(r)
+
+    if not spawnThread(cont, c): 
+        cont(c) 
+
+    return cp
+
+
+@inform
 def handleInput(cont):
-    enter('handleInput')
 
-    t = createContainer()
-    markAsFirst(t)
+    t = Container()
+
+    t.markAsFirst()
 
     hasinput = True
     while hasinput:
@@ -118,116 +235,47 @@ def handleInput(cont):
         if line == '':
             hasinput = False
         else:
-            log("handleInput -> %r" % line)
-            t = insertContainer(cont, t, Record({'str': line}))
+            log("read input: %r", line)
+            t = insertContainer(cont, t, Rec({'str': line}))
 
-    log("handleInput: EOF")
-    return leave()
+    log("read input: EOF")
+    
 
+@inform
 def spawnThread(cont, c):
     # FIXME: for now inoperative
     return False
 
-def insertContainer(cont, c, r):
-    enter('insertContainer')
-    cp = createContainer()
-    
-    cp.next = c.next
-    c.next = cp
-
-    markNextPos(c)
-
-    c.record = r
-    log("update rec: c -> %r" % c)
-
-    # LOGIC FOR CONCURRENCY HERE
-    if not spawnThread(cont, c): 
-        cont(c) 
-        
-    return leave(cp)
-
-
 def writeOutput(record):
     print record
 
-def freeContainer(c):
-    # in python nothing to do, just drop ref
-    log("freeContainer(%r)" % c)
-
-def propagateFirst(c):
-    c.next.pli = INFINITY
-
+@inform
 def handleOutput(c):
-    enter('handleOutput(%r)' % c)
-
     # FIXME: "wait until isFirst(c)"
-    while not isFirst(c):
+    while not c.isFirst():
         # FIXME: maybe yield here somehow?
         pass
 
-    log("handleOutput -> %r" % c)
-    writeOutput(c.record)
-    propagateFirst(c)
-    freeContainer(c)
+    log("c = %r",  c)
 
-    return leave()
+    writeOutput(c.record)
+
+    c.propagateFirst()
+    c.freeContainer()
+
+    # simply return
 
 def hset(s):
     if type(s) != set:
         s = set(s)
     return tuple(s)
 
-# -------- Network tree --------
-
-class Top(object):
-    def __init__(self, N):
-        self.N = N
-
-class Seq(object):
-    def __init__(self, N, M):
-        self.N = N
-        self.M = M
-
-class Box(object):
-    def __init__(self, f):
-        # f: box function
-        # prototype: f(outf, record)
-        self.f = f        
-
-class Out(object):
-    pass
-
-class Sync(object):
-    def __init__(self, K):
-        self.K = K
-
-class Star(object):
-    def __init__(self, gamma, N):
-        self.gamma = gamma
-        self.N = N
-
-class Par(object):
-    def __init__(self, sigma, N, M):
-        self.sigma = sigma
-        self.N = N
-        self.M = M
-
-class Bling(object):
-    def __init__(self, N, tag):
-        self.N = N
-        self.tag = tag
-
 # -------- hydra C_{seq} -------
 
-def modifyRecord(f, c):
+@inform
+def modifyRec(f, c):
     # apply box function to record, replace result
-    enter("modifyRecord(%r)" % c)
 
-    d = [None]
-    def outf(r):
-        enter("outf(%r)" % r)
-        d[0] = r
-        leave()
 
     f(outf, c.record)
 
@@ -237,39 +285,56 @@ def modifyRecord(f, c):
     return leave(c)
 
 def Box_seq(f):
-    def boxf(c):
-        enter("%sbox[%s]%s(%r)" % (cBRIGHT, f.__name__, cNORMAL, c))
 
-        tailcall()
-        return modifyRecord(f, c) # tailcall
+    @informp(f)
+    def boxf(c):
+
+        # the box function wants to use a function "outf(X)" with
+        # the intended meaning to "output record X". So we create
+        # a python list to "contain" the record until the box
+        # function terminates.    
+        d = [None]
+        @inform
+        def outf(r):
+            d[0] = r
+
+        # call the box function
+        f(outf, c.record)
+
+        # update the container
+        c.setRec(d[0])
+
+        return c
+
     return boxf
 
 def Seq_seq(N, M):
-    def seqf(c):
-        enter("%sseq[%r,%r]%s(%r)" % (cBRIGHT, N, M,  cNORMAL, c))
-        
-        m = N(c)
 
-        tailcall()
-        return M(m) # tailcall
+    @handletc
+    @informp(N,M)
+    def seqf(c):
+        return tailcall(M, N(c))
+
     return seqf
 
 def Out_seq():
-    def outf(c):
-        enter("out(%r)" % c)
 
-        tailcall()
-        return handleOutput(c) # tailcall
+    @handletc
+    @inform
+    def outf(c):
+        return tailcall(handleOutput, c)
+
     return outf
 
 def Top_seq(N):
+
+    @handletc
+    @informp(N)
     def topf():
-        enter("top[%r]" % N)
 
         cont = Seq_seq(N, Out_seq())
-
-        tailcall()
-        return handleInput(cont) # tailcall
+        
+        return tailcall(handleInput, cont)
 
     return topf
 
@@ -277,22 +342,22 @@ def Top_seq(N):
 if __name__ == "__main__" and sys.argv[1] == 'seq':
     print "testing seq: network = box(stripnl)..box(wrapcolon)"
 
+    @inform
     def stripnl(outf, s):
         # {str} -> {str}
-        enter("stripnl(%r)" % s)
         l = s['str'].rstrip()
-        outf(Record({'str': l}))
-        leave()
+        outf( Rec({'str': l})) 
 
+
+    @inform
     def wrapcolon(outf, s):
         # {str} -> {str}
-        enter("wrapcolon(%r)" % s)
         l = ':' + s['str'] + ':'
-        outf(Record({'str': l}))
-        leave()
+        outf( Rec({'str': l}) )
 
 
     net = Top_seq(Seq_seq(Box_seq(stripnl), Box_seq(wrapcolon)))
+
 
     net()
 
@@ -302,16 +367,19 @@ if __name__ == "__main__" and sys.argv[1] == 'seq':
 '''
 # disabled, replaced by Box_mult below
 def Box_mult_p(f):
+    @handletc
+    @informp(f)
     def boxf(cont, c):
-        enter("box[%s](%r, %r)" % (f.__name__, cont, c))
         outlist = []
+
+        @inform
         def outf(r):
-            enter("outf(%r)" % r)
             outlist.append(r)
-            return leave()
+
         f(outf, c.record)
-        r = handleMult(cont, c, outlist) # tailcall
-        return leave(r)
+
+        return tailcall(handleMult, cont, c, outlist)
+
     return boxf
 '''
 
@@ -320,149 +388,129 @@ def Box_mult(f):
     # to avoid constructing a list with the output records;
     # this is needed to support boxes with "infinite" number of output records.
 
+    @handletc
+    @informp(f)
     def boxf(cont, c):
-        enter("box[%s](%r, %r)" % (f.__name__, cont, c))
+
         d = [c, None]
+
+        @inform
         def outf(r):
-            enter("outf(%r)" % r)
             c, prevrec = d
             if prevrec is not None:
                 c = insertContainer(cont, c, prevrec[0])
             d[0:2] = (c, (r,))
-            leave()
 
         f(outf, c.record)
         
         c, lastrec = d
         if lastrec is None:
-            tailcall()
-            return markAsDone(c) # tailcall
+            c.markAsDone()
+            return
         else:
-            c.record = lastrec[0]
-            log("update rec: c -> %r" % c)
+            c.setRec(lastrec[0])
 
-            tailcall()
-            return cont(c)      # tailcall
+            return tailcall(cont, c)
             
     return boxf
 
 def Seq_mult(N, M):
+    @handletc
+    @informp(N,M)
     def seqf(cont, c):
-        enter("seq[%r,%r](%r, %r)" % (N, M, cont, c))
-        def cont_N(cp):
-            enter("cont_N(%r)" % cp)
 
-            tailcall()
-            return M(cont, cp) # tailcall
+        @handletc
+        @inform
+        def seqf_cont_N(cp):
+            return tailcall(M, cont, cp)
 
-        tailcall()
-        return N(cont_N, c) # tailcall
+        return tailcall(N, seqf_cont_N, c)
 
     return seqf
 
 def Top_mult(N):
+
+    @handletc
+    @informp(N)
     def topf():
-        enter("top[%r]" % N)
-        def cont_out(cp):
-            enter("cont_out(%r)" % cp)
-            tailcall()
-            return handleOutput(cp) # tailcall
 
-        def cont_in(c):
-            enter("cont_in(%r)" % c)
-            tailcall()
-            return N(cont_out, c) # tailcall
+        @handletc
+        @inform
+        def topf_cont_out(cp):
+            return tailcall(handleOutput, cp)
 
-        tailcall()
-        return handleInput(cont_in) # tailcall
+        @handletc
+        @inform
+        def topf_cont_in(c):
+            return tailcall(N, topf_cont_out, c)
+
+        return tailcall(handleInput, topf_cont_in)
 
     return topf
 
-def markAsDone(c):
-    enter("markAsDone(%r)" % c)
-    c.pos = INFINITY
-    c.next.pli = c.pli
-    log("c -> %r" % c)
-    leave()
 
-'''
+@handletc
+@inform
 def handleMult(cont, c, res):
-    enter("handleMult(%r, %r, %r)" % (cont, c, res))
-    for i,n in enumerate(res):
-        if i == (len(res) - 1):
-            c.record = n
 
-            tailcall()
-            return cont(c) # tailcall
-
-        c = insertContainer(cont, c, n)
-
-    tailcall()
-    return markAsDone(c) # tailcall
-'''
-
-
-# handleMult expanded to iterative form above
-def handleMult(cont, c, res):
-    enter("handleMult(%r, %r, %r)" % (cont, c, res))
     if len(res) == 0:
-        tailcall()
-        return markAsDone(c)  # tailcall
-    elif len(res) == 1:
-        c.record = res[0]
-        log("update rec: c -> %r" % c)
+        c.markAsDone()
+        return
 
-        tailcall()
-        return cont(c)        # tailcall
+    elif len(res) == 1:
+        c.setRec(res[0])
+
+        return tailcall(cont, c)
+
     else:
         cp = insertContainer(cont, c, res[0])
 
-        tailcall()
-        return handleMult(cont, cp, res[1:]) # tailcall
+        return tailcall(handleMult, cont, cp, res[1:])
 
 
 # test code
 if __name__ == "__main__" and sys.argv[1] == 'mult':
     print "testing mult: ",
 
+    @inform
     def empty(outf, s):
         # {str} -> {str}
-        enter("empty(%r)" % s)
-        return leave()
-        #return []
+        pass
 
+    @inform
     def dup(outf, s):
         # {str} -> {str}
-        enter("dup(%r)" % s)
-        outf(Record({'str' : s['str'] + '1'}))
-        outf(Record({'str' : s['str'] + '2'}))
-        return leave()
+        outf(Rec({'str' : s['str'] + '1'}))
+        outf(Rec({'str' : s['str'] + '2'}))
 
-
+    @inform
     def dup3(outf, s):
         # {str} -> {str}
-        enter("dup3(%r)" % s)
-        outf(Record({'str' : s['str'] + '1'}))
-        outf(Record({'str' : s['str'] + '2'}))
-        outf(Record({'str' : s['str'] + '3'}))
-        return leave()
+        outf(Rec({'str' : s['str'] + '1'}))
+        outf(Rec({'str' : s['str'] + '2'}))
+        outf(Rec({'str' : s['str'] + '3'}))
 
-
+    @inform
     def stripnl(outf, s):
         # {str} -> {str}
-        enter("stripnl(%r)" % s)
-        outf(Record({'str' : s['str'].rstrip()}))
-        return leave()
+        outf(Rec({'str' : s['str'].rstrip()}))
 
+    @inform
     def wrapcolon(outf, s):
         # {str} -> {str}
-        enter("wrapcolon(%r)" % s)
-        outf(Record({'str' : ':' + s['str'] + ':'}))
-        return leave()
+        outf(Rec({'str' : ':' + s['str'] + ':'}))
+
+    @inform
+    def ident(outf, s):
+        # {str} -> {str}
+        outf(s)
 
     if sys.argv[2] == '0':
         print "network = box(empty)..(box(stripnl)..box(wrapcolon))"
         net = Top_mult(Seq_mult(Box_mult(empty), Seq_mult(Box_mult(stripnl), Box_mult(wrapcolon))))
+    elif sys.argv[2] == '1i':
+        print "network = box(ident)..((box(stripnl)..box(wrapcolon))..(box(ident)..box(ident))"
+        net = Top_mult(Seq_mult(Box_mult(ident), Seq_mult(Seq_mult(Box_mult(stripnl), Box_mult(wrapcolon)), Seq_mult(Box_mult(ident), Box_mult(ident)))))
     elif sys.argv[2] == '1':
         print "network = box(stripnl)..box(wrapcolon)"
         net = Top_mult(Seq_mult(Box_mult(stripnl), Box_mult(wrapcolon)))
@@ -482,274 +530,248 @@ if __name__ == "__main__" and sys.argv[1] == 'mult':
 
 # -------- hydra C_{sync} -------
 
+class Pattern(tuple):
+    def __repr__(self):
+        return '{%s}' % ', '.join(self)
 
 def Box_sync(f):
+    @handletc
+    @informp(f)
     def boxf(cont, c):
-        enter("box[%r](%r, %r)" % (f.__name__, cont, c))
+        # FIXME: unfold handleMult to handle infinite multiplicity here (like with _mult above)
+
         recs = []
+        
+        @inform
         def outf(r):
-            enter("outf(%r)" % r)
             recs.append(r)
-            leave()
+
         f(outf, c.record)
 
-        posInc(c)
+        c.posInc()
 
-        tailcall()
-        return handleMult(cont, c, recs) # tailcall
+        return tailcall(handleMult, cont, c, recs) 
 
     return boxf
 
 def Sync_sync(K):
-    def syncf(cont, c):
-        enter("sync[%r](%r, %r)" % (K, cont, c))
 
-        tailcall()
-        return handleSync(cont, c, K) # tailcall
+    @handletc
+    @informp(K)
+    def syncf(cont, c):
+        return tailcall(handleSync, cont, c, K)
 
     return syncf
 
 def Seq_sync(N, M):
-    def seqf(cont, c):
-        enter("seq[%r,%r](%r, %r)" % (N, M, cont, c))
-        def cont_N(cp):
-            enter("cont_N(%r)" % cp)
-            
-            tailcall()
-            return M(cont, cp) # tailcall
 
-        tailcall()
-        return N(cont_N, c) # tailcall
+    @handletc
+    @informp(N, M)
+    def seqf(cont, c):
+
+        @handletc
+        @inform
+        def seqf_cont_N(cp):
+            return tailcall(M, cont, cp)
+
+        return tailcall(N, seqf_cont_N, c) 
 
     return seqf
 
 def Top_sync(N):
+
+    @handletc
+    @informp(N)
     def topf():
-        enter("top[%r]" % N)
-        def cont_out(cp):
-            enter("cont_out(%r)" % cp)
 
-            tailcall()
-            return handleOutput(cp) # tailcall
+        @handletc
+        @inform
+        def topf_cont_out(c):
+            return tailcall(handleOutput, c) 
 
-        def cont_in(c):
-            enter("cont_in(%r)" % c)
-            
-            tailcall()
-            return N(cont_out, c)
+        @handletc
+        @inform
+        def topf_cont_in(c):
+            return tailcall(N, topf_cont_out, c)
 
-        tailcall()
-        return handleInput(cont_in) # tailcall
+        return tailcall(handleInput, topf_cont_in)
 
     return topf
 
 class syncstate(object):
+
+    @informobjp(updater = True)
     def __init__(self, pos, K):
+        self.pats = tuple(K.pats)
         slots = {}
         plimax = {}
-        for p in K.pats:
+        for p in self.pats:
             slots[p] = None
             plimax[p] = 0
         self.slots = slots
         self.plimax = plimax
         self.outputpli = pos
-        log("syncstate.init -> %r" % self)
-
 
     def __repr__(self):
-        return "S@%d(%r)" % (id(self),(self.slots,self.plimax,self.outputpli),)
+        rv = []
+        for k in self.pats:
+            rv.append('%s : (%r ; %s%r%s)' % (k, self.slots[k], cBLUE, self.plimax[k], cNORMAL))
+        return '[ %s | outputpli %s%r%s ]%s@%x%s' % (', '.join(rv), 
+                                                     cBLUE, self.outputpli, cNORMAL, 
+                                                     cDARK, id(self), cNORMAL)
 
-    def storeRecord(self, H, r):
-        enter("syncstate.storeRecord(%r, %r, %r)" % (self, H, r))
-
+    @informobjp(updater = True)
+    def storeRec(self, H, r):
         for h in H:
             assert h in self.slots
             assert self.slots[h] is None
             self.slots[h] = r
 
-        log("slots <- %r" % self.slots)
-        leave()
-
+    @informobj
     def getPlimax(self, pat):
         assert pat in self.plimax
         return self.plimax[pat]
 
+    @informobjp(updater = True)
     def setPlimax(self, pat, val):
-        enter("syncstate.setPlimax(%r, %r, %r)" % (self, pat, val))
-
         assert pat in self.plimax
         self.plimax[pat] = val
 
-        log("plimax <- %r" % self.plimax)
-        leave()
-
+    @informobj
     def getOutputpli(self):
-        enter("syncstate.getOutputpli(%r)" % (self))
-        return leave(self.outputpli)
+        return self.outputpli
 
+    @informobjp(updater = True)
     def setOutputpli(self, val):
-        enter("syncstate.setOutputpli(%r, %r)" % (self, val))
         self.outputpli = val
-        log("outputpli -> %r" % val)
-        leave()
 
+    @informobj
     def isComplete(self, H):
         # """The procedure isComplete is true if all slots, except
         # those indicated in its second argument, have been filled by
-        # calls to storeRecord."""
-        enter("syncstate.isComplete(%r, %r)" % (self, H))
+        # calls to storeRec."""
 
         for k,v in self.slots.items():
             if k in H:
                 continue
             if v is None:
-                return leave(False)
+                return False
 
-        return leave(True)
+        return True
 
+    @informobj
     def matchesAll(self, H):
-        enter("syncstate.matchesAll(%r, %r)" % (self, H))
         # H is the set of all fields in the synchroncell for which the current record
         # is *the* candidate, ie all slots with a matching pattern that were not filled by predecessors.
         # If H is the entire set of slots, the record matches all patterns of the synchrocell.
-        for k in self.slots.keys():
+
+        for k in self.pats:
             if k not in H:
-                return leave(False)
-        return leave(True)
+                return False
+        return True
 
-
+    @informobj
     def combineSyncMatches(self, H, rec):
         # """The procedure isComplete is true if all slots, except
         # those indicated in its second argument, have been filled by
-        # calls to storeRecord. If no successor was found and all
+        # calls to storeRec. If no successor was found and all
         # slots have been filled, the calling thread must continue
         # with the combined result"""
         # -> combine only combines the slots not in H
-        enter("syncstate.combineSyncMatches(%r, %r, %r)" % (self, H, rec))
 
-        newrec = dict(rec)
-        for k,v in self.slots.items():
+        firstpat = self.pats[0]
+        if self.slots[firstpat] is None:
+            assert firstpat in H
+            baserec = rec
+        else:
+            baserec = self.slots[firstpat]
+        log("baserec = %r", baserec)
+
+        for k in self.pats[1:]:
             if k in H:
-                continue
+                sourcerec = rec
+            else:
+                sourcerec = self.slots[k]
+            
             for t in k:
-                assert t not in newrec
-                newrec[t] = v[t]
+                baserec[t] = sourcerec[t]
 
-        return leave(newrec)
+        return baserec
 
 all_syncstates = {}
 
+@inform
 def getSyncState(pos, K):
     if pos not in all_syncstates:
         all_syncstates[pos] = syncstate(pos, K)
     return all_syncstates[pos]
-
-def getPlimax(ss, pat):
-    return ss.getPlimax(pat)
-
-def setPlimax(ss, pat, val):
-    return ss.setPlimax(pat, val)
-
-def getOutputpli(ss):
-    return ss.getOutputpli()
-
-def setOutputpli(ss, pli):
-    return ss.setOutputpli(pli)
-
-def propagatePli(c):
-    enter("propagatePli(%r)" % c)
-    c.next.pli = c.pos
-    log("c -> %r" % c)
-    leave()
-    
-def matchesAll(s, H):
-    return s.matchesAll(H)
-
-def combineSyncMatches(s, H, rec):
-    return s.combineSyncMatches(H, rec)
-
-def storeRecord(s, H, rec):
-    return s.storeRecord(H, rec)
-
-def isComplete(s, H):
-    return s.isComplete(H)
-
-def isDone(c):
-    enter("isDone(%r)" % c)
-    return leave(c.pos == INFINITY)
-    
-def posInc(c):
-    enter("posInc(%r)" % c)
-    c.pos += 1
-    log("c -> %r" % c)
-    leave()
-    
-
+   
+@handletc
+@inform 
 def handleSync(cont, c, K):
-    enter("handleSync(%r, %r, %r)" % (cont, c, K))
 
     s = getSyncState(c.pos, K)
-    log("s <- %r" % s)
+    log("s = %r", s)
 
     M = K(c.record)
-    log("M <- %r" % M)
+    log("M := %r", M)
 
     H = set()
     pli = c.pli
+
     while len(M) > 0:
         newM = set(M)
         for p in M:
-            plimax = getPlimax(s, p)
+            plimax = s.getPlimax(p)
             if plimax > pli:
                 newM.remove(p)
             elif pli > c.pos:
                 newM.remove(p)
                 H.add(p)
                 plimax = INFINITY
-            setPlimax(s, p, max(pli, plimax))
+            s.setPlimax(p, maxindex(pli, plimax))
             if c.pli > pli:
-                propagatePli(c)
+                c.propagatePli()
                 pli = c.pli
         M = newM
-        log("M = %r" % M)
+        log("M := %r", M)
 
     log("H = %r" % H)
 
-    if len(H) > 0 and not matchesAll(s, H):
+    if len(H) > 0: # and not s.matchesAll(H):
         done = False
         while not done:
             done = False
-            plimin = getOutputpli(s)
+            plimin = s.getOutputpli()
 
-            log("pli = %r, plimin = %r" % (pli, plimin))
+            log("pli = %r, plimin = %r", pli, plimin)
 
-            if isComplete(s, H):
+            if s.isComplete(H):
                 log("isComplete = yes")
-                c.record = combineSyncMatches(s, H, c.record)
+                r = s.combineSyncMatches(H, c.record)
+                c.setRec(r)
                 done = True
 
             elif pli > plimin:
                 log("pli > plimin")
-                storeRecord(s, H, c.record)
-                markAsDone(c)
+                s.storeRec(H, c.record)
+                c.markAsDone()
                 done = True
 
-            setOutputpli(s, min(pli, plimin))
-            log("c.pli = %r, pli = %r" % (c.pli, pli))
+            s.setOutputpli(minindex(pli, plimin))
+
+            log("c.pli = %r, pli = %r", c.pli, pli)
 
             if c.pli > pli:
-                propagatePli(c)
+                c.propagatePli()
                 pli = c.pli
 
-            log("-> pli = %r, c = %r" % (pli, c))
+            log("-> pli = %r, c = %r", pli, c)
 
-    if not done: #isDone(c):
-        posInc(c)
+    if not c.isDone():
+        c.posInc()
 
-        tailcall()
-        return cont(c) # tailcall
-
-    leave()
+        return tailcall(cont, c)
 
 
 class SyncMatcher(object):
@@ -759,7 +781,7 @@ class SyncMatcher(object):
         self.pats = patterns
 
     def __repr__(self):
-        return ("SM(%r)" % (self.pats,))
+        return "[| %s |]" % ', '.join((repr(x) for x in self.pats))
 
     def __call__(self, rec):
         # compute which patterns are matched by rec 
@@ -782,38 +804,40 @@ class SyncMatcher(object):
             if not failmatch:
                 matches.add(tv)
         return matches
-            
-        
 
 # test code
 if __name__ == "__main__" and sys.argv[1] == 'sync':
     print "testing sync"
 
+    @inform
     def dup(outf, s):
         # {str} -> {A}|{B}
-        enter("dup(%r)" % s)
-        outf(Record({'A' : s['str'] + '1'}))
-        outf(Record({'B' : s['str'] + '2'}))
-        return leave()
+        outf(Rec({'A' : s['str'] + '1'}))
+        outf(Rec({'B' : s['str'] + '2'}))
 
+    @inform
     def concat(outf, s):
         # {A,B} -> {str}
-        enter("concat(%r)" % s)
-        outf(Record({'str' : '<%s:%s>' % (s.get('A','?'), s.get('B','?'))}))
-        return leave()
+        outf(Rec({'str' : '<%s:%s>' % (s.get('A','?'), s.get('B','?'))}))
 
+    @inform
     def stripnl(outf, s):
         # {str} -> {str}
-        enter("stripnl(%r)" % s)
-        outf(Record({'str' : s['str'].rstrip()}))
-        return leave()
+        outf(Rec({'str' : s['str'].rstrip()}))
+
+    @inform
     def ident(outf, s):
         # {str} -> {str}
-        enter("ident(%r)" % s)
         outf(s)
-        return leave()
 
-    if sys.argv[2] == "nosync":
+    if sys.argv[2] == "nosync1":
+        net = Top_sync(
+            Seq_sync(
+                Box_sync(stripnl), 
+                Box_sync(ident)
+                )
+            )
+    if sys.argv[2] == "nosync2":
         net = Top_sync(
             Seq_sync(
                 Seq_sync(
@@ -824,19 +848,15 @@ if __name__ == "__main__" and sys.argv[1] == 'sync':
                 )
             )
 
-    elif sys.argv[2] == "nopat":
-        net = Top_sync(
-            Sync_sync(SyncMatcher(hset([hset([])])))
-            )
     elif sys.argv[2] == "1pat":
         net = Top_sync(
-            Sync_sync(SyncMatcher(hset([hset(['str'])])))
+            Sync_sync(SyncMatcher((Pattern(('str',)),)))
             )
     else:
         net = Top_sync(
             Seq_sync(
                 Box_sync(dup),
-                Sync_sync(SyncMatcher(hset([hset(['A']), hset(['B'])])))
+                Sync_sync(SyncMatcher((Pattern(('A',)), Pattern(('B',)))))
                 )
             )
 
